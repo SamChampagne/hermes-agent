@@ -822,12 +822,32 @@ class HermesACPAgent(acp.Agent):
             )
             return
 
+        server_names = [server.name for server in mcp_servers]
+        # Persist the registered MCP server names on the session so any LATER
+        # agent rebuild can re-apply the tool surface. set_session_model (and
+        # provider switches) replace state.agent wholesale via _make_agent,
+        # which starts from default toolsets (["hermes-acp"]) — without this,
+        # switching the model right after openSession silently strips every MCP
+        # tool the agent just gained, and the model reports "no Pulsar tools".
+        setattr(state, "mcp_server_names", server_names)
+        self._refresh_agent_tool_surface(state, server_names)
+
+    def _refresh_agent_tool_surface(self, state, mcp_server_names) -> None:
+        """Recompute the agent's tool surface to include the session's MCP servers.
+
+        Safe to call any time after ``register_mcp_servers`` connected the
+        servers: the connections live in a module-global registry, so the tools
+        remain available even on a freshly rebuilt agent. Idempotent (toolset
+        expansion dedupes) and best-effort (never raises).
+        """
+        if not mcp_server_names:
+            return
         try:
             from model_tools import get_tool_definitions
 
             enabled_toolsets = _expand_acp_enabled_toolsets(
                 getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
-                mcp_server_names=[server.name for server in mcp_servers],
+                mcp_server_names=list(mcp_server_names),
             )
             state.agent.enabled_toolsets = enabled_toolsets
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
@@ -843,13 +863,14 @@ class HermesACPAgent(acp.Agent):
             if callable(invalidate):
                 invalidate()
             logger.info(
-                "Session %s: refreshed tool surface after ACP MCP registration (%d tools)",
+                "Session %s: refreshed tool surface for MCP servers %s (%d tools)",
                 state.session_id,
+                list(mcp_server_names),
                 len(state.agent.tools or []),
             )
         except Exception:
             logger.warning(
-                "Session %s: failed to refresh tool surface after ACP MCP registration",
+                "Session %s: failed to refresh tool surface for MCP servers",
                 state.session_id,
                 exc_info=True,
             )
@@ -1992,6 +2013,10 @@ class HermesACPAgent(acp.Agent):
                 base_url=current_base_url,
                 api_mode=current_api_mode,
             )
+            # The rebuilt agent starts from default toolsets — re-apply any MCP
+            # servers registered for this session so a model switch does not
+            # strip the agent's MCP (e.g. Pulsar) tools.
+            self._refresh_agent_tool_surface(state, getattr(state, "mcp_server_names", None))
             self.session_manager.save_session(session_id)
             logger.info(
                 "Session %s: model switched to %s via provider %s",
